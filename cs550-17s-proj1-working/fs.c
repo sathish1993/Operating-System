@@ -16,13 +16,12 @@
 #include "mmu.h"
 #include "proc.h"
 #include "spinlock.h"
-#include "fs.h"
 #include "buf.h"
+#include "fs.h"
 #include "file.h"
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static void itrunc(struct inode*);
-struct superblock sb;   // there should be one per dev, but we run with one dev
 
 // Read the super block.
 void
@@ -55,10 +54,12 @@ balloc(uint dev)
 {
   int b, bi, m;
   struct buf *bp;
+  struct superblock sb;
 
   bp = 0;
+  readsb(dev, &sb);
   for(b = 0; b < sb.size; b += BPB){
-    bp = bread(dev, BBLOCK(b, sb));
+    bp = bread(dev, BBLOCK(b, sb.ninodes));
     for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
       m = 1 << (bi % 8);
       if((bp->data[bi/8] & m) == 0){  // Is block free?
@@ -79,10 +80,11 @@ static void
 bfree(int dev, uint b)
 {
   struct buf *bp;
+  struct superblock sb;
   int bi, m;
 
   readsb(dev, &sb);
-  bp = bread(dev, BBLOCK(b, sb));
+  bp = bread(dev, BBLOCK(b, sb.ninodes));
   bi = b % BPB;
   m = 1 << (bi % 8);
   if((bp->data[bi/8] & m) == 0)
@@ -99,8 +101,8 @@ bfree(int dev, uint b)
 // its size, the number of links referring to it, and the
 // list of blocks holding the file's content.
 //
-// The inodes are laid out sequentially on disk at
-// sb.startinode. Each inode has a number, indicating its
+// The inodes are laid out sequentially on disk immediately after
+// the superblock. Each inode has a number, indicating its
 // position on the disk.
 //
 // The kernel keeps a cache of in-use inodes in memory
@@ -160,12 +162,9 @@ struct {
 } icache;
 
 void
-iinit(int dev)
+iinit(void)
 {
   initlock(&icache.lock, "icache");
-  readsb(dev, &sb);
-  cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d inodestart %d bmap start %d\n", sb.size,
-          sb.nblocks, sb.ninodes, sb.nlog, sb.logstart, sb.inodestart, sb.bmapstart);
 }
 
 static struct inode* iget(uint dev, uint inum);
@@ -179,9 +178,12 @@ ialloc(uint dev, short type)
   int inum;
   struct buf *bp;
   struct dinode *dip;
+  struct superblock sb;
+
+  readsb(dev, &sb);
 
   for(inum = 1; inum < sb.ninodes; inum++){
-    bp = bread(dev, IBLOCK(inum, sb));
+    bp = bread(dev, IBLOCK(inum));
     dip = (struct dinode*)bp->data + inum%IPB;
     if(dip->type == 0){  // a free inode
       memset(dip, 0, sizeof(*dip));
@@ -202,7 +204,7 @@ iupdate(struct inode *ip)
   struct buf *bp;
   struct dinode *dip;
 
-  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+  bp = bread(ip->dev, IBLOCK(ip->inum));
   dip = (struct dinode*)bp->data + ip->inum%IPB;
   dip->type = ip->type;
   dip->major = ip->major;
@@ -279,7 +281,7 @@ ilock(struct inode *ip)
   release(&icache.lock);
 
   if(!(ip->flags & I_VALID)){
-    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+    bp = bread(ip->dev, IBLOCK(ip->inum));
     dip = (struct dinode*)bp->data + ip->inum%IPB;
     ip->type = dip->type;
     ip->major = dip->major;
@@ -648,4 +650,86 @@ struct inode*
 nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
+}
+
+void checkfs(){
+  struct buf *bp;
+  struct dinode *dip;
+  struct superblock sb;
+  struct inode *ip;
+  struct dirent de;
+  uint inodenum, addr;
+  int i = 0, inodecount = 0, problemfound = 0; 
+  readsb(1, &sb);
+
+  int directory[sb.ninodes];
+ 
+  //Iterate through all the available inodes to find the ones that are allocated 
+  for(inodenum = 1; inodenum < sb.ninodes; inodenum++){
+     directory[inodenum] = 0;
+     bp = bread(1, IBLOCK(inodenum));
+     dip = (struct dinode*)bp->data + inodenum%IPB;
+     //inode is allocated
+     if(dip->type == 1){ 
+       iget(1,inodenum);
+       inodecount++;
+     }
+     brelse(bp);
+  }
+  
+  //Iterate through all the directories to find the ones that are allocated
+  for(i = 0; i < inodecount; i++){
+     for(ip = &icache.inode[i]; ip < &icache.inode[NINODE]; ip++){
+       if(ip->ref!=0){
+
+         ilock(ip);
+
+         if(ip->type == 1){
+          for(addr = 0; addr < ip->size; addr += sizeof(de)){
+   	    
+ 	     if(readi(ip, (char*)&de, addr, sizeof(de)) != sizeof(de))
+               panic("dirlink read");
+
+             if(de.inum == 0)
+               continue;
+
+            directory[de.inum] = 1;
+           }
+         }
+      
+	 iunlock(ip);
+      }
+    }
+  }
+
+  cprintf("------------------------------------------------------------------------------------\n");
+  cprintf("Running fsck ...\n");
+  
+  //Checking if inode of the directory is free
+  for(inodenum = 1; inodenum < sb.ninodes; inodenum++){
+  
+    bp = bread(1, IBLOCK(inodenum));
+    dip = (struct dinode*)bp->data + inodenum%IPB;
+    //if directory has problem resolve it by assigning its type to 0
+    
+    if(dip->type != 0){
+    
+      if(directory[inodenum] == 0){
+   
+        cprintf("fsck: inode %d is allocated but is not referenced by any dir! Fixing ... Done.\n",inodenum);
+        dip->type = 0;
+        bwrite(bp);
+        problemfound = 1;
+   
+     }
+   
+    }   
+    brelse(bp);
+  }
+
+  if(problemfound == 0){
+     cprintf("fsck: no problem found.\n");
+  }
+
+  cprintf("------------------------------------------------------------------------------------\n");
 }
